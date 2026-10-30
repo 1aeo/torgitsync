@@ -31,7 +31,7 @@ jobs:
           GH_REPO: ${{ vars.TOR_GITHUB_REPO || '1aeo/tor' }}
           GL_USER: ${{ secrets.TOR_GITLAB_USER }}
           GL_PAT: ${{ secrets.TOR_SYNC_GITLAB_PAT }}
-          GL_FORK_PATH: ${{ secrets.TOR_GITLAB_FORK_PATH }}
+          GL_FORK_PATH: ${{ vars.TOR_GITLAB_FORK_PATH || secrets.TOR_GITLAB_FORK_PATH }}
           DRY_RUN: ${{ inputs.dry_run || false }}
         run: |
           set -euo pipefail
@@ -73,17 +73,32 @@ jobs:
             '+refs/tags/*:refs/tags/*'
 
           # 3. If GitLab fork secrets are configured, sync upstream + opt-in `mr/*` branches -> GitLab fork
-          if [ -z "${GL_FORK_PATH:-}" ] || [ -z "${GL_PAT:-}" ]; then
+          GL_FORK_CLEAN="${GL_FORK_PATH:-}"
+          GL_FORK_CLEAN="${GL_FORK_CLEAN#https://gitlab.torproject.org/}"
+          GL_FORK_CLEAN="${GL_FORK_CLEAN#http://gitlab.torproject.org/}"
+          GL_FORK_CLEAN="${GL_FORK_CLEAN#/}"
+          GL_FORK_CLEAN="${GL_FORK_CLEAN%/}"
+          GL_FORK_CLEAN="${GL_FORK_CLEAN%.git}"
+
+          if [ -z "${GL_FORK_CLEAN}" ] || [ -z "${GL_PAT:-}" ]; then
             echo "::notice::TOR_GITLAB_FORK_PATH / TOR_SYNC_GITLAB_PAT not configured yet — synced upstream -> ${GH_REPO}; skipping GitLab fork sync."
             exit 0
           fi
 
+          case "${GL_FORK_CLEAN}" in
+            */*) ;;
+            *)
+              echo "::error::TOR_GITLAB_FORK_PATH must be '<gitlab-username>/<fork-repo>' (e.g. '1aeo/tor'), without token value."
+              exit 1
+              ;;
+          esac
+
           GL_AUTH_USER="${GL_USER:-oauth2}"
           GL_AUTH=$(printf '%s:%s' "$GL_AUTH_USER" "$GL_PAT" | base64 | tr -d '\n')
           git config "http.https://gitlab.torproject.org/.extraheader" "AUTHORIZATION: basic ${GL_AUTH}"
-          git remote add gitlab "https://gitlab.torproject.org/${GL_FORK_PATH}.git"
+          git remote add gitlab "https://gitlab.torproject.org/${GL_FORK_CLEAN}.git"
 
-          echo "Syncing upstream refs -> gitlab:${GL_FORK_PATH}..."
+          echo "Syncing upstream refs -> gitlab:${GL_FORK_CLEAN}..."
           git push ${DRY_FLAG:+"$DRY_FLAG"} gitlab \
             '+refs/remotes/upstream/main:refs/heads/main' \
             '+refs/remotes/upstream/maint-*:refs/heads/maint-*' \
@@ -94,7 +109,7 @@ jobs:
           git fetch --prune github '+refs/heads/mr/*:refs/remotes/github-mr/*'
           git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/github-mr/ | while read -r branch; do
             [ -z "$branch" ] && continue
-            echo "Syncing ${GH_REPO}:mr/${branch} -> gitlab:${GL_FORK_PATH}:${branch}"
+            echo "Syncing ${GH_REPO}:mr/${branch} -> gitlab:${GL_FORK_CLEAN}:${branch}"
             git push ${DRY_FLAG:+"$DRY_FLAG"} gitlab "+refs/remotes/github-mr/${branch}:refs/heads/${branch}"
           done
 
