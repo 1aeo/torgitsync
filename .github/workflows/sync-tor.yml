@@ -1,0 +1,106 @@
+name: Sync Tor Upstream & MR Branches
+
+on:
+  schedule:
+    - cron: '17 */2 * * *' # Every 2 hours
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run git pushes without modifying remote refs'
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [sync-tor]
+
+permissions:
+  contents: read
+  actions: write # Resets GitHub's 60-day cron inactivity timer on dedicated sync repos
+
+concurrency:
+  group: sync-tor-mirrors
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync upstream -> 1aeo/tor & GitLab fork, and mr/* -> GitLab fork
+        env:
+          GH_PAT: ${{ secrets.TOR_SYNC_GITHUB_PAT }}
+          GH_REPO: ${{ vars.TOR_GITHUB_REPO || '1aeo/tor' }}
+          GL_USER: ${{ secrets.TOR_GITLAB_USER }}
+          GL_PAT: ${{ secrets.TOR_SYNC_GITLAB_PAT }}
+          GL_FORK_PATH: ${{ secrets.TOR_GITLAB_FORK_PATH }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::Missing secret TOR_SYNC_GITHUB_PAT (fine-grained PAT for ${GH_REPO} with Contents: Read and write)."
+            exit 1
+          fi
+
+          DRY_FLAG=""
+          if [ "${DRY_RUN}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+            echo "Running in --dry-run mode"
+          fi
+
+          git init --bare tor-sync.git
+          cd tor-sync.git
+
+          git remote add upstream "https://gitlab.torproject.org/tpo/core/tor.git"
+          git remote add github "https://github.com/${GH_REPO}.git"
+
+          # 1. Fetch upstream branches & tags anonymously (skips GitLab internal refs/merge-requests/* & keep-around/*)
+          echo "Fetching upstream tpo/core/tor..."
+          git fetch --prune upstream \
+            '+refs/heads/main:refs/remotes/upstream/main' \
+            '+refs/heads/maint-*:refs/remotes/upstream/maint-*' \
+            '+refs/heads/release-*:refs/remotes/upstream/release-*' \
+            '+refs/tags/*:refs/tags/*'
+
+          # 2. Authenticate to GitHub via HTTP header (never embed tokens in remote URLs) and update 1aeo/tor
+          GH_AUTH=$(printf 'x-access-token:%s' "$GH_PAT" | base64 | tr -d '\n')
+          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${GH_AUTH}"
+
+          echo "Syncing upstream refs -> github:${GH_REPO}..."
+          git push ${DRY_FLAG:+"$DRY_FLAG"} github \
+            '+refs/remotes/upstream/main:refs/heads/main' \
+            '+refs/remotes/upstream/maint-*:refs/heads/maint-*' \
+            '+refs/remotes/upstream/release-*:refs/heads/release-*' \
+            '+refs/tags/*:refs/tags/*'
+
+          # 3. If GitLab fork secrets are configured, sync upstream + opt-in `mr/*` branches -> GitLab fork
+          if [ -z "${GL_FORK_PATH:-}" ] || [ -z "${GL_PAT:-}" ]; then
+            echo "::notice::TOR_GITLAB_FORK_PATH / TOR_SYNC_GITLAB_PAT not configured yet — synced upstream -> ${GH_REPO}; skipping GitLab fork sync."
+            exit 0
+          fi
+
+          GL_AUTH_USER="${GL_USER:-oauth2}"
+          GL_AUTH=$(printf '%s:%s' "$GL_AUTH_USER" "$GL_PAT" | base64 | tr -d '\n')
+          git config "http.https://gitlab.torproject.org/.extraheader" "AUTHORIZATION: basic ${GL_AUTH}"
+          git remote add gitlab "https://gitlab.torproject.org/${GL_FORK_PATH}.git"
+
+          echo "Syncing upstream refs -> gitlab:${GL_FORK_PATH}..."
+          git push ${DRY_FLAG:+"$DRY_FLAG"} gitlab \
+            '+refs/remotes/upstream/main:refs/heads/main' \
+            '+refs/remotes/upstream/maint-*:refs/heads/maint-*' \
+            '+refs/remotes/upstream/release-*:refs/heads/release-*' \
+            '+refs/tags/*:refs/tags/*'
+
+          echo "Checking github:${GH_REPO} for mr/* branches..."
+          git fetch --prune github '+refs/heads/mr/*:refs/remotes/github-mr/*'
+          git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/github-mr/ | while read -r branch; do
+            [ -z "$branch" ] && continue
+            echo "Syncing ${GH_REPO}:mr/${branch} -> gitlab:${GL_FORK_PATH}:${branch}"
+            git push ${DRY_FLAG:+"$DRY_FLAG"} gitlab "+refs/remotes/github-mr/${branch}:refs/heads/${branch}"
+          done
+
+      - name: Reset 60-day scheduled workflow inactivity timer
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT "/repos/${GITHUB_REPOSITORY}/actions/workflows/sync-tor.yml/enable"
