@@ -175,8 +175,8 @@ jobs:
             if (
               git log --format='%B' "${best_mb}..${ref}"
               git diff -U0 "${best_mb}..${ref}" | grep -E '^\+[^+]' || true
-            ) | grep -qE '(/Users/|/home/|Mac-Studio|\.local>)'; then
-              echo "::error::mr/${branch}: local machine path or hostname leaked in commit message or diff"
+            ) | grep -qE '(/Users/|/home/|Mac-Studio|\.local>|Claude-Session:|Co-[Aa]uthored-[Bb]y:.*(Claude|Cursor|Antigravity|noreply@anthropic\.com|cursoragent@cursor\.com))'; then
+              echo "::error::mr/${branch}: local machine path, hostname, or AI session trailer leaked in commit message or diff"
               mr_failed=1
               continue
             fi
