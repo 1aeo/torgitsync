@@ -203,12 +203,12 @@ jobs:
                 python3 scripts/maint/lintChanges.py "${changes_files[@]}"
               fi
 
-              python3 scripts/maint/checkIncludes.py
+              python3 scripts/maint/practracker/includes.py .
             ) || check_ok=0
             git worktree remove --force "$wt_dir" || rm -rf "$wt_dir"
 
             if [ "$check_ok" -ne 1 ]; then
-              echo "::error::mr/${branch}: failed Tor maintainer checks (checkSpace/lintChanges/checkIncludes)"
+              echo "::error::mr/${branch}: failed Tor maintainer checks (checkSpace/lintChanges/includes)"
               mr_failed=1
               continue
             fi
