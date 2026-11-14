@@ -9,7 +9,15 @@ Dedicated sync controller keeping [`1aeo/tor`](https://github.com/1aeo/tor) (and
    - Leaves all WIP / feature branches on `1aeo/tor` untouched.
 2. **Upstream + `mr/*` → GitLab Fork (when GitLab secrets are configured):**
    - Keeps `main`, `maint-*`, `release-*`, and tags on `https://gitlab.torproject.org/<TOR_GITLAB_FORK_PATH>.git` aligned with upstream.
-   - Syncs opt-in `mr/<branch>` branches from `1aeo/tor` → `<branch>` on the GitLab fork (stripping the `mr/` prefix) for submitting and updating GitLab Merge Requests.
+   - Syncs opt-in `mr/<branch>` branches from `1aeo/tor` → `<branch>` on the GitLab fork (stripping the `mr/` prefix) for submitting and updating GitLab Merge Requests. MR updates are fast-forward only; divergent maintainer edits or rebases stop publication until reconciled. Upstream mirror pushes request exact upstream refs, subject to destination protections.
+
+## Mirror protection
+
+Verified 2026-11-14: GitHub ruleset `27279925` blocks deletion and non-fast-forward updates of `main`, `maint-*`, and `release-*` with no bypass actors. Ruleset `26185050` also requires a reviewed pull request, with a repository-role bypass. These rules do **not** restrict writes exclusively to this sync controller: a permitted actor can still advance a branch. Tags are outside these branch rulesets.
+
+The workflow's `+` mirror refspecs cannot override GitHub's no-bypass rule. Normal upstream fast-forwards continue to work; upstream rewinds or accidental divergent mirror commits cause sync to fail and need deliberate reconciliation. This workflow never changes branch protections to unblock itself.
+
+The local `tor.git/hooks/pre-push` links to [hooks/tor-pre-push](hooks/tor-pre-push). It prevents accidental direct mirror/tag pushes, wrong destinations and MR deletion, and requires `CTOR_ALLOW_MR_PUSH=1` for an already-authorized `mr/*` submission to GitHub `1aeo/tor`. The flag records intent, not approval or test evidence. Hooks are local and bypassable (`--no-verify` or a changed hooks path); they are not a server authorization boundary.
 
 ## Repository Secrets (`1aeo/torgitsync`)
 
@@ -34,11 +42,17 @@ GH_TOKEN="$(gh auth token -u 1aeo)" gh secret set TOR_SYNC_GITLAB_PAT  -R 1aeo/t
 ## Publishing a Branch to GitLab for an MR
 
 1. Develop and review on `1aeo/tor` (`topic/*` branches off `main` or `maint-*`) and pass `~/1aeo/ctor/tor-research/bin/ctor-audit --build`.
-2. Before pushing any `mr/*` branch to the GitLab fork, `sync-tor.yml` enforces a pre-MR hygiene gate (rejects reserved names and `release-*`/tag bases, enforces `1aeo <github@1aeo.com>` author/committer identity, blocks local path/agent-file leaks, and runs `checkSpace.pl`, `lintChanges.py`, and `checkIncludes.py`).
+2. Before pushing any `mr/*` branch to the GitLab fork, `sync-tor.yml` rejects reserved names and release-only ancestry, checks every outgoing commit for the expected identity and private metadata/artifacts, and runs upstream-baseline `checkSpace.pl`, `lintChanges.py`, and `practracker/includes.py` against the candidate. It also blocks the known private-canary metric identifiers from patch-stack commits 18/19, even in removed code or renamed branches. Candidate changes cannot replace these validators. This is a hygiene check; build and behavioral evidence remain the responsibility of `ctor-audit --build` and the effort review.
 3. When ready to open or update a GitLab Merge Request, push under `mr/*` on `1aeo/tor` and trigger an immediate sync:
 
 ```bash
-git push origin topic/my-feature:mr/my-feature --force-with-lease
+CTOR_ALLOW_MR_PUSH=1 git push origin topic/my-feature:mr/my-feature --force-with-lease
 GH_TOKEN="$(gh auth token -u 1aeo)" gh workflow run sync-tor.yml -R 1aeo/torgitsync
 GH_TOKEN="$(gh auth token -u 1aeo)" gh run watch -R 1aeo/torgitsync
 ```
+
+If a GitLab MR branch diverges, fetch and review its changes before reconciling the source branch. The scheduled sync never force-updates an MR branch. Naming a ref after a release tag cannot be reconstructed from Git ancestry; use the worktree helper to select a supported development base.
+
+## Local verification
+
+`python3 -m unittest discover -s tests -v` exercises the actual workflow shell script against disposable local repositories, including lint failures, deleted private artifacts, validator replacement, symlink escapes, and divergent MR updates. It does not contact GitHub or GitLab. Run `actionlint .github/workflows/sync-tor.yml` for workflow validation.

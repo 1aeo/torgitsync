@@ -40,6 +40,10 @@ jobs:
             echo "::error::Missing secret TOR_SYNC_GITHUB_PAT (fine-grained PAT for ${GH_REPO} with Contents: Read and write)."
             exit 1
           fi
+          if [[ ! "$GH_REPO" =~ ^1aeo/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::TOR_GITHUB_REPO must name a repository owned by 1aeo."
+            exit 1
+          fi
 
           DRY_FLAG=""
           if [ "${DRY_RUN}" = "true" ]; then
@@ -63,6 +67,7 @@ jobs:
 
           # 2. Authenticate to GitHub via HTTP header (never embed tokens in remote URLs) and update 1aeo/tor
           GH_AUTH=$(printf 'x-access-token:%s' "$GH_PAT" | base64 | tr -d '\n')
+          echo "::add-mask::${GH_AUTH}"
           git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${GH_AUTH}"
 
           echo "Syncing upstream refs -> github:${GH_REPO}..."
@@ -85,16 +90,15 @@ jobs:
             exit 0
           fi
 
-          case "${GL_FORK_CLEAN}" in
-            */*) ;;
-            *)
-              echo "::error::TOR_GITLAB_FORK_PATH must be '<gitlab-username>/<fork-repo>' (e.g. '1aeo/tor'), without token value."
-              exit 1
-              ;;
-          esac
+          if [[ ! "$GL_FORK_CLEAN" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)+$ ]] ||
+             [[ "${GL_FORK_CLEAN,,}" == "tpo/core/tor" ]]; then
+            echo "::error::TOR_GITLAB_FORK_PATH must name a fork namespace/repository, never tpo/core/tor."
+            exit 1
+          fi
 
           GL_AUTH_USER="${GL_USER:-oauth2}"
           GL_AUTH=$(printf '%s:%s' "$GL_AUTH_USER" "$GL_PAT" | base64 | tr -d '\n')
+          echo "::add-mask::${GL_AUTH}"
           git config "http.https://gitlab.torproject.org/.extraheader" "AUTHORIZATION: basic ${GL_AUTH}"
           git remote add gitlab "https://gitlab.torproject.org/${GL_FORK_CLEAN}.git"
 
@@ -154,45 +158,79 @@ jobs:
               continue
             fi
 
-            bad_id=0
-            while IFS=$'\t' read -r sha ae ce; do
-              if [ "$ae" != "1aeo <github@1aeo.com>" ] || [ "$ce" != "1aeo <github@1aeo.com>" ]; then
-                echo "::error::mr/${branch}: commit ${sha} has invalid identity (author='${ae}', committer='${ce}')"
-                bad_id=1
-              fi
-            done < <(git log --format='%h%x09%an <%ae>%x09%cn <%ce>' "${best_mb}..${ref}")
-            if [ "$bad_id" -eq 1 ]; then
-              mr_failed=1
-              continue
-            fi
+            # Inspect every outgoing commit, including content removed again later.
+            # Do not echo offending content or identities into public CI logs.
+            if ! python3 - "$best_mb" "$ref" <<'PY'
+          import pathlib
+          import re
+          import subprocess
+          import sys
 
-            if git diff --name-only "${best_mb}..${ref}" | grep -qE '(^|/)(AGENTS\.md|CLAUDE\.md|\.claude|\.cursor|\.gemini)(/|$)'; then
-              echo "::error::mr/${branch}: agent instruction files must not be tracked"
-              mr_failed=1
-              continue
-            fi
+          def git(*args):
+              return subprocess.check_output(["git", *args])
 
-            if (
-              git log --format='%B' "${best_mb}..${ref}"
-              git diff -U0 "${best_mb}..${ref}" | grep -E '^\+[^+]' || true
-            ) | grep -qE '(/Users/|/home/|Mac-Studio|\.local>|Claude-Session:|Co-[Aa]uthored-[Bb]y:.*(Claude|Cursor|Antigravity|noreply@anthropic\.com|cursoragent@cursor\.com))'; then
-              echo "::error::mr/${branch}: local machine path, hostname, or AI session trailer leaked in commit message or diff"
+          leak = re.compile(rb"/Users/|/home/|Mac-Studio|\.local>|Claude-Session:|Co-[Aa]uthored-[Bb]y:.*(?:Claude|Cursor|Antigravity|noreply@anthropic\.com|cursoragent@cursor\.com)")
+          # PATCH-STACK.md commits 18/19 are private-canary-only, regardless of branch name.
+          private_canary = re.compile(rb"relay_create_cell_source_total|relay_begindir_cell_source_total|relay_hsdir_fetch_descriptor_total")
+          for sha in git("rev-list", f"{sys.argv[1]}..{sys.argv[2]}").split():
+              sha = sha.decode("ascii")
+              identity = git("show", "-s", "--format=%an <%ae>%n%cn <%ce>", sha).splitlines()
+              if identity != [b"1aeo <github@1aeo.com>"] * 2:
+                  sys.exit(f"::error::Commit {sha}: invalid author/committer identity")
+              if leak.search(git("show", "-s", "--format=%B", sha)):
+                  sys.exit(f"::error::Commit {sha}: private metadata in commit message")
+              parents = git("show", "-s", "--format=%P", sha).decode().split()
+              if not parents:
+                  parents = [subprocess.check_output(["git", "hash-object", "-w", "-t", "tree", "--stdin"], input=b"").decode().strip()]
+              for parent in parents:
+                  for raw in git("diff", "--name-only", "--no-renames", "--diff-filter=ACMT", "-z", parent, sha).split(b"\0"):
+                      path = pathlib.PurePosixPath(raw.decode("utf-8", "surrogateescape"))
+                      if set(path.parts) & {"AGENTS.md", "CLAUDE.md", ".claude", ".cursor", ".gemini", ".codex"} or path.suffix.lower() in {".csv", ".npz", ".deb", ".ddeb"} or path.name.startswith("perf.data") or ".pcap" in path.name.lower():
+                          sys.exit(f"::error::Commit {sha}: forbidden agent or raw artifact path")
+                  diff = git("diff", "--text", "--no-ext-diff", "--no-textconv", "--no-renames", "-U0", parent, sha)
+                  in_hunk = False
+                  for line in diff.splitlines():
+                      if line.startswith(b"diff --git "):
+                          in_hunk = False
+                      elif line.startswith(b"@@"):
+                          in_hunk = True
+                      elif in_hunk and line.startswith(b"+"):
+                          if private_canary.search(line[1:]):
+                              sys.exit(f"::error::Commit {sha}: private-canary-only instrumentation cannot be upstreamed")
+                          if leak.search(line[1:]):
+                              sys.exit(f"::error::Commit {sha}: private metadata in added content")
+          PY
+            then
               mr_failed=1
               continue
             fi
 
             wt_dir="${RUNNER_TEMP}/mr-check"
-            rm -rf "$wt_dir"
+            checks_dir="$(mktemp -d "${RUNNER_TEMP}/tor-checks.XXXXXX")"
+            # Run trusted upstream validators, never executable code from the MR.
+            git archive "$best_mb" scripts/maint | tar -x -C "$checks_dir"
             git worktree add --detach "$wt_dir" "$ref"
             check_ok=1
             (
               cd "$wt_dir"
+              # Validators read candidate files; keep links inside that snapshot.
+              python3 -I - <<'PY' || exit 1
+          import pathlib
+          root = pathlib.Path.cwd()
+          for path in root.rglob("*"):
+              if path.is_symlink():
+                  try:
+                      path.resolve().relative_to(root)
+                  except (ValueError, RuntimeError):
+                      raise SystemExit("::error::MR contains an escaping or cyclic symlink")
+          PY
+              unset GH_PAT GH_AUTH GL_PAT GL_AUTH
               c_files=()
               while IFS= read -r f; do
                 [ -n "$f" ] && c_files+=("$f")
               done < <(git diff --name-only --diff-filter=ACMR "${best_mb}..HEAD" -- '*.[ch]' '*.inc')
               if [ "${#c_files[@]}" -gt 0 ]; then
-                perl scripts/maint/checkSpace.pl -C "${c_files[@]}"
+                perl "$checks_dir/scripts/maint/checkSpace.pl" -C "${c_files[@]}" || exit 1
               fi
 
               changes_files=()
@@ -200,12 +238,13 @@ jobs:
                 [ -n "$f" ] && changes_files+=("$f")
               done < <(git diff --name-only --diff-filter=ACMR "${best_mb}..HEAD" -- 'changes/*')
               if [ "${#changes_files[@]}" -gt 0 ]; then
-                python3 scripts/maint/lintChanges.py "${changes_files[@]}"
+                python3 -I "$checks_dir/scripts/maint/lintChanges.py" "${changes_files[@]}" || exit 1
               fi
 
-              python3 scripts/maint/practracker/includes.py .
+              python3 -I "$checks_dir/scripts/maint/practracker/includes.py" . || exit 1
             ) || check_ok=0
-            git worktree remove --force "$wt_dir" || rm -rf "$wt_dir"
+            git worktree remove --force "$wt_dir"
+            rm -rf "$checks_dir"
 
             if [ "$check_ok" -ne 1 ]; then
               echo "::error::mr/${branch}: failed Tor maintainer checks (checkSpace/lintChanges/includes)"
@@ -214,7 +253,10 @@ jobs:
             fi
 
             echo "Syncing ${GH_REPO}:mr/${branch} -> gitlab:${GL_FORK_CLEAN}:${branch}"
-            git push ${DRY_FLAG:+"$DRY_FLAG"} gitlab "+refs/remotes/github-mr/${branch}:refs/heads/${branch}"
+            if ! git push ${DRY_FLAG:+"$DRY_FLAG"} gitlab "refs/remotes/github-mr/${branch}:refs/heads/${branch}"; then
+              echo "::error::mr/${branch}: push failed; reconcile any GitLab-side changes before retrying. No forced MR updates."
+              mr_failed=1
+            fi
           done < <(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/github-mr/)
 
           if [ "$mr_failed" -ne 0 ]; then

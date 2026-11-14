@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Local accidental-push guard, not an authorization or build-proof mechanism.
+# Git can bypass hooks with --no-verify; server rules and review still matter.
+case "${2:-}" in
+  https://github.com/1aeo/tor|https://github.com/1aeo/tor.git|\
+  https://1aeo@github.com/1aeo/tor|https://1aeo@github.com/1aeo/tor.git|\
+  git@github.com:1aeo/tor|git@github.com:1aeo/tor.git|\
+  ssh://git@github.com/1aeo/tor|ssh://git@github.com/1aeo/tor.git) ;;
+  *)
+    echo "ERROR: this C Tor checkout may push only to GitHub 1aeo/tor." >&2
+    exit 1
+    ;;
+esac
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/mr/*)
+      case "${remote_ref#refs/heads/mr/}" in
+        main|HEAD|maint-*|release-*)
+          echo "ERROR: reserved MR branch name would collide with an upstream mirror." >&2
+          exit 1
+          ;;
+      esac
+      if [[ "$local_sha" =~ ^0+$ ]]; then
+        echo "ERROR: this checkout does not delete remote MR branches." >&2
+        exit 1
+      fi
+      if [ "${CTOR_ALLOW_MR_PUSH:-0}" != "1" ]; then
+        echo "ERROR: mr/* triggers GitLab synchronization. Set CTOR_ALLOW_MR_PUSH=1 only for an already-authorized, reviewed submission." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "ERROR: direct mirror/tag and ad-hoc branch pushes are disabled; use an authorized mr/* submission." >&2
+      exit 1
+      ;;
+  esac
+done
